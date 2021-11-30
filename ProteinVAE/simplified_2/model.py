@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torch_geometric.transforms as T
+# import torch_geometric.transforms as T
 from torch_geometric.utils.convert import from_networkx
 from torch_geometric.data import DenseDataLoader
 from torch_geometric.nn import DenseGCNConv as GCNConv
@@ -30,46 +30,58 @@ class GNN(nn.Module):
 
 # Encoder, DiffPool
 class DiffPoolEncoder(nn.Module):
-    def __init__(self, num_nodes1):
+    def __init__(self, num_nodes1, num_nodes2):
         super(DiffPoolEncoder, self).__init__()
 
-        self.gnn1_pool = GNN(21, 32, num_nodes1) # in_channels, hidden_channels, out_channels
-        self.gnn1_embed = GNN(21, 32, 32)
+        self.gnn1_pool = GNN(21, 64, num_nodes1) # in_channels, hidden_channels, out_channels
+        self.gnn1_embed = GNN(21, 64, 64)
 
-        self.gnn3_embed = GNN(32, 32, 32)
+        self.gnn2_pool = GNN(64, 64, num_nodes2)
+        self.gnn2_embed = GNN(64, 64, 64)
 
-        self.lin1_mu = torch.nn.Linear(32, 32)
-        self.lin2_mu = torch.nn.Linear(32, 1)
+        self.gnn3_embed = GNN(64, 64, 64)
 
-        self.lin1_logsigma = torch.nn.Linear(32, 32)
-        self.lin2_logsigma = torch.nn.Linear(32, 1)
+        self.lin1_mu = torch.nn.Linear(64, 64)
+        self.lin2_mu = torch.nn.Linear(64, 1)
+
+        self.lin1_logsigma = torch.nn.Linear(64, 64)
+        self.lin2_logsigma = torch.nn.Linear(64, 1)
 
     def forward(self, x, adj):
         s = self.gnn1_pool(x, adj) # torch.Size([1, num_nodes, 5])
-        x = self.gnn1_embed(x, adj) # torch.Size([1, num_nodes, 32])
+        x = self.gnn1_embed(x, adj) # torch.Size([1, num_nodes, 64])
         x, adj, l1, e1 = dense_diff_pool(x, adj, s) # see https://pytorch-geometric.readthedocs.io/en/latest/modules/nn.html
         # now x has shape torch.Size([1, 5, 64])
         # adj has shape torch.Size([1, 5, 5])
 
-        x = self.gnn3_embed(x, adj) # torch.Size([1, 2, 32])
-        x = x.mean(dim=1) # torch.Size([1, 32])
+        s = self.gnn2_pool(x, adj) # torch.Size([1, 5, 2])
+        x = self.gnn2_embed(x, adj) # torch.Size([1, 5, 64])
+        x, adj, l2, e2 = dense_diff_pool(x, adj, s)
+        # now x has shape torch.Size([1, 2, 64])
+        # adj has shape torch.Size([1, 2, 2])
+
+        x = self.gnn3_embed(x, adj) # torch.Size([1, 2, 64])
+        x = x.mean(dim=1) # torch.Size([1, 64])
 
         # mu func
         mu = self.lin2_mu(F.relu(self.lin1_mu(x))) # torch.Size([1, 1])
         logsigma = self.lin2_logsigma(F.relu(self.lin1_logsigma(x))) # torch.Size([1, 1])
-        return mu, logsigma, l1  , e1
+        return mu, logsigma, l1 + l2, e1 + e2
 
 
 # Decoder, DiffPool
 class DiffPoolDecoder(nn.Module):
-    def __init__(self, num_nodes1,  output_nodes):
+    def __init__(self, num_nodes1, num_nodes2, output_nodes):
         super(DiffPoolDecoder, self).__init__()
 
-        self.gnn1_pool = GNN(32, 32, num_nodes1) # in_channels, hidden_channels, out_channels
-        self.gnn1_embed = GNN(32, 32, 32)
+        self.gnn1_pool = GNN(64, 64, num_nodes1) # in_channels, hidden_channels, out_channels
+        self.gnn1_embed = GNN(64, 64, 64)
 
-        self.gnn2_pool = GNN(32, 32, output_nodes)
-        self.gnn2_embed = GNN(32, 32, 21)
+        self.gnn2_pool = GNN(64, 64, num_nodes2)
+        self.gnn2_embed = GNN(64, 64, 64)
+
+        self.gnn3_pool = GNN(64, 64, output_nodes)
+        self.gnn3_embed = GNN(64, 64, 21)
 
         self.softmax_x = nn.Softmax(dim=2) # x shape: (batch_size, num_of_nodes_in_protein, feature_length)
         self.sigmoid_adj = nn.Sigmoid()
@@ -83,17 +95,21 @@ class DiffPoolDecoder(nn.Module):
         x = self.gnn2_embed(x, adj)
         x, adj, l2, e2 = dense_diff_pool(x, adj, s)
 
+        s = self.gnn3_pool(x, adj)
+        x = self.gnn3_embed(x, adj)
+        x, adj, l3, e3 = dense_diff_pool(x, adj, s)
+
         x = self.softmax_x(x)
         adj = self.sigmoid_adj(adj)
 
-        return x, adj, l1 + l2 , e1 + e2
+        return x, adj, l1 + l2 + l3, e1 + e2 + e3
 
 
 class LGVAE(nn.Module):
-    def __init__(self, num_nodes1, num_of_nodes_in_protein = 1500):
+    def __init__(self, num_nodes1, num_nodes2, num_of_nodes_in_protein = 1500):
         super(LGVAE, self).__init__()
-        self.encoder = DiffPoolEncoder(num_nodes1)
-        self.decoder = DiffPoolDecoder(num_nodes1, num_of_nodes_in_protein)
+        self.encoder = DiffPoolEncoder(num_nodes1, num_nodes2)
+        self.decoder = DiffPoolDecoder(num_nodes2, num_nodes1, num_of_nodes_in_protein)
     def forward(self, x, adj):
         # encode
         batch_size = x.shape[0]
@@ -102,11 +118,11 @@ class LGVAE(nn.Module):
         if is_CUDA == True:
             mu_s = mu.cpu().view(-1).detach().numpy().tolist() # now mu is a list with len = 1
             sigma_s = torch.exp(logsigma).cpu().view(-1).detach().numpy().tolist()
-        z = torch.zeros(0, 1, 32)
+        z = torch.zeros(0, 1, 64)
         for i in range(0,batch_size):
             mu_now = mu_s[i]
             sigma_now = sigma_s[i]
-            z_0_now = torch.normal(mu_now, sigma_now, size=(1, 1, 32)) # batch_size, num_of_nodes, num of features
+            z_0_now = torch.normal(mu_now, sigma_now, size=(1, 1, 64)) # batch_size, num_of_nodes, num of features
             z = torch.cat((z,sigma_now*z_0_now+mu_now), dim = 0)
         adj = torch.zeros(batch_size, 1, 1) + 1.0
         if is_CUDA == True:
